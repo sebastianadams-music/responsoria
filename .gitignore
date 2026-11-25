@@ -1,0 +1,4 @@
+node_modules/
+dist/
+raw_audio/
+.DS_Store
