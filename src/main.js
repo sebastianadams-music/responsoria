@@ -71,20 +71,15 @@ function updatePointer(clientX, clientY) {
   engine.setUserPosition(x, y);
 }
 
-let starting = false;
-let started = false;
+let startedOnce = false;
 
-async function tryUnlockAudio() {
-  if (started || starting) return;
-  starting = true;
-  if (promptEl) promptEl.classList.add("hidden");
-  const ok = await engine.start();
-  if (ok) {
-    started = true;
-  } else {
-    starting = false;
-    if (promptEl) promptEl.classList.remove("hidden");
+function tryUnlockAudio() {
+  engine.unlockFromGesture();
+  if (!startedOnce) {
+    startedOnce = true;
+    if (promptEl) promptEl.classList.add("hidden");
   }
+  engine.start();
 }
 
 window.addEventListener("pointermove", (e) => {
@@ -93,6 +88,29 @@ window.addEventListener("pointermove", (e) => {
 
 window.addEventListener("pointerdown", (e) => {
   updatePointer(e.clientX, e.clientY);
+  tryUnlockAudio();
+});
+
+window.addEventListener(
+  "touchstart",
+  (e) => {
+    if (e.touches && e.touches[0]) {
+      updatePointer(e.touches[0].clientX, e.touches[0].clientY);
+    }
+    tryUnlockAudio();
+  },
+  { passive: true }
+);
+
+window.addEventListener(
+  "touchend",
+  () => {
+    tryUnlockAudio();
+  },
+  { passive: true }
+);
+
+window.addEventListener("click", () => {
   tryUnlockAudio();
 });
 

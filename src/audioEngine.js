@@ -22,6 +22,19 @@ function scaledCurve(base, peak) {
   return out;
 }
 
+function decodeAudioCompat(ctx, arrayBuffer) {
+  return new Promise((resolve, reject) => {
+    try {
+      const maybePromise = ctx.decodeAudioData(arrayBuffer, resolve, reject);
+      if (maybePromise && typeof maybePromise.then === "function") {
+        maybePromise.then(resolve, reject);
+      }
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
 /**
  * Generates a dark, warm stereo cathedral impulse response (~1.85s).
  */
@@ -75,13 +88,15 @@ export class ResponsoriaAudioEngine {
     this.spriteBuffers = new Map();
     this.loadedSprites = new Set();
     this.spriteFetchPromises = [];
+    this._spriteLoadPromise = null;
+    this._unlockedPrimed = false;
 
     this.mode = "user";
     this.userPos = { x: 0.5, y: 0.5 };
 
     this.isDataReady = false;
     this.isRunning = false;
-    this.startTime = 0;
+    this.startTime = null;
     this.loopCount = 0;
     this.nextNoteIdx = 0;
     this.nextPhraseIdx = 0;
@@ -202,40 +217,71 @@ export class ResponsoriaAudioEngine {
     }
   }
 
+  unlockFromGesture() {
+    try {
+      if (typeof navigator !== "undefined" && navigator.audioSession) {
+        navigator.audioSession.type = "playback";
+      }
+    } catch {}
+
+    this._ensureContext();
+
+    if (this.ctx.state !== "running") {
+      try {
+        const p = this.ctx.resume();
+        if (p && typeof p.catch === "function") p.catch(() => {});
+      } catch {}
+    }
+
+    if (!this._unlockedPrimed) {
+      try {
+        const buf = this.ctx.createBuffer(1, 1, this.ctx.sampleRate || 44100);
+        const src = this.ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(this.ctx.destination);
+        src.start(0);
+        this._unlockedPrimed = true;
+      } catch {}
+    }
+  }
+
   async _loadSprites() {
     if (!this.corpus) return;
+    if (this._spriteLoadPromise) return this._spriteLoadPromise;
+
     const decodeSprite = async (url, idx) => {
-      try {
-        let arr = this.spriteFetchPromises[idx] ? await this.spriteFetchPromises[idx] : null;
-        if (!arr) {
-          const res = await fetch(url);
-          arr = await res.arrayBuffer();
-        }
-        const decoded = await this.ctx.decodeAudioData(arr.slice(0));
-        this.spriteBuffers.set(idx, decoded);
-        this.loadedSprites.add(idx);
-      } catch (err) {
-        console.error(`Failed loading sprite ${idx}:`, err);
+      let arr = this.spriteFetchPromises[idx] ? await this.spriteFetchPromises[idx] : null;
+      if (!arr) {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+        arr = await res.arrayBuffer();
       }
+      const decoded = await decodeAudioCompat(this.ctx, arr.slice(0));
+      this.spriteBuffers.set(idx, decoded);
+      this.loadedSprites.add(idx);
+      return idx;
     };
 
-    // Decode all 5 pre-fetched sprites in parallel; first decoded sprite unlocks playback immediately
-    const tasks = this.corpus.sprites.map((url, idx) => decodeSprite(url, idx));
-    await Promise.race(tasks);
+    const tasks = this.corpus.sprites.map((url, idx) =>
+      decodeSprite(url, idx).catch((err) => {
+        console.error(`Failed loading sprite ${idx}:`, err);
+        throw err;
+      })
+    );
+
+    this._spriteLoadPromise = Promise.any(tasks)
+      .catch(() => {})
+      .finally(() => {
+        if (this.loadedSprites.size === 0) {
+          this._spriteLoadPromise = null;
+        }
+      });
+
+    return this._spriteLoadPromise;
   }
 
   async start() {
-    this._ensureContext();
-    if (this.ctx.state === "suspended") {
-      try {
-        await this.ctx.resume();
-      } catch {
-        return false;
-      }
-    }
-    if (this.ctx.state !== "running") {
-      return false;
-    }
+    this.unlockFromGesture();
 
     await this.preloadMetadata();
     if (this.loadedSprites.size === 0) {
@@ -245,6 +291,20 @@ export class ResponsoriaAudioEngine {
     if (!this.isRunning && this.loadedSprites.size > 0) {
       this._ensureFormantBank();
       this.isRunning = true;
+      this.startTime = null;
+      if (!this.schedulerTimer) {
+        this.schedulerTimer = setInterval(() => this._schedule(), 25);
+      }
+    }
+    return this.isRunning;
+  }
+
+  _schedule() {
+    if (!this.isRunning || !this.ctx || this.ctx.state !== "running" || this.loadedSprites.size === 0) {
+      return;
+    }
+
+    if (this.startTime === null) {
       this.startTime = this.ctx.currentTime + 0.02;
       this.loopCount = 0;
       this.nextNoteIdx = 0;
@@ -258,14 +318,7 @@ export class ResponsoriaAudioEngine {
       for (let b = 0; b < this.bandGains.length; b++) {
         this.bandGains[b].gain.setValueAtTime(0.0001, this.startTime);
       }
-
-      this.schedulerTimer = setInterval(() => this._schedule(), 25);
     }
-    return this.isRunning;
-  }
-
-  _schedule() {
-    if (!this.isRunning || !this.ctx || this.loadedSprites.size === 0) return;
 
     const lookaheadSec = 0.12;
     const now = this.ctx.currentTime;
@@ -400,8 +453,10 @@ export class ResponsoriaAudioEngine {
 
     const env = this.ctx.createGain();
     env.gain.value = 0.0001;
+    const fadeOutStart = Math.max(safeWhen + fi + 0.002, safeWhen + dur - fo);
+    const fadeOutDur = Math.max(0.003, safeWhen + dur - fadeOutStart);
     env.gain.setValueCurveAtTime(scaledCurve(BASE_FADE_IN, targetGain), safeWhen, fi);
-    env.gain.setValueCurveAtTime(scaledCurve(BASE_FADE_OUT, targetGain), safeWhen + dur - fo, fo);
+    env.gain.setValueCurveAtTime(scaledCurve(BASE_FADE_OUT, targetGain), fadeOutStart, fadeOutDur);
 
     src.connect(env);
     env.connect(this.grainBus);
