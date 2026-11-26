@@ -1,6 +1,33 @@
 /**
+ * Inverts a point in [0, 1]^2 across both axes and swaps interior <-> perimeter:
+ * points near the center map near the edges/corners and vice versa, while flipping X and Y.
+ */
+export function invertPoint(x, y, step = 0) {
+  const u = x - 0.5;
+  const v = y - 0.5;
+  const rho = 2 * Math.max(Math.abs(u), Math.abs(v));
+
+  if (rho < 1e-4) {
+    const angle = step * 2.399963229728653;
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const scale = 0.48 / Math.max(Math.abs(cos), Math.abs(sin));
+    return {
+      x: 0.5 + cos * scale,
+      y: 0.5 + sin * scale,
+    };
+  }
+
+  const invScale = -(1 - rho) / rho;
+  return {
+    x: Math.min(1, Math.max(0, 0.5 + u * invScale)),
+    y: Math.min(1, Math.max(0, 0.5 + v * invScale)),
+  };
+}
+
+/**
  * Concatenative segment selector supporting k-NN (k=5) user selection
- * and phrase-level farthest-distance answer selection.
+ * and phrase-level inverted-space answer selection.
  */
 export class SegmentSelector {
   /**
@@ -104,7 +131,8 @@ export class SegmentSelector {
   }
 
   /**
-   * Select one of the k=5 farthest segments from the corresponding user selection.
+   * Select one of the k=5 nearest segments to the inverted coordinates of the
+   * corresponding user selection (swapping center <-> perimeter and flipping X/Y axes).
    * When advance=false (bridging sustain grain), reuses currentAnswerRef.
    */
   selectAnswer(k = 5, availableSprites = null, { advance = true } = {}) {
@@ -117,6 +145,7 @@ export class SegmentSelector {
       this.answerStep += 1;
     }
     const ref = this.currentAnswerRef;
+    const target = invertPoint(ref.x, ref.y, this.answerStep);
 
     const candidates = this._candidateIndices(availableSprites);
     if (candidates.length === 0) return null;
@@ -125,12 +154,12 @@ export class SegmentSelector {
     for (let i = 0; i < candidates.length; i++) {
       const idx = candidates[i];
       const seg = this.segments[idx];
-      const dx = seg.x - ref.x;
-      const dy = seg.y - ref.y;
+      const dx = seg.x - target.x;
+      const dy = seg.y - target.y;
       scored[i] = { idx, distSq: dx * dx + dy * dy };
     }
 
-    return this._pickFromTopK(scored, k, false);
+    return this._pickFromTopK(scored, k, true);
   }
 
   beginUserPhrase() {

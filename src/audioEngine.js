@@ -35,6 +35,13 @@ function decodeAudioCompat(ctx, arrayBuffer) {
   });
 }
 
+function getRootPrefix() {
+  if (typeof window !== "undefined" && window.location && /\/v\d+(\/|$)/.test(window.location.pathname)) {
+    return "../";
+  }
+  return "";
+}
+
 /**
  * Generates a dark, warm stereo cathedral impulse response (~1.85s).
  */
@@ -119,10 +126,11 @@ export class ResponsoriaAudioEngine {
   async preloadMetadata() {
     if (this.dataPromise) return this.dataPromise;
     this.dataPromise = (async () => {
+      const prefix = getRootPrefix();
       const [corpusRes, timelineRes, formantRes] = await Promise.all([
-        fetch("data/corpus.json"),
-        fetch("data/timeline.json"),
-        fetch("data/formants.bin"),
+        fetch(`${prefix}data/corpus.json`),
+        fetch(`${prefix}data/timeline.json`),
+        fetch(`${prefix}data/formants.bin`),
       ]);
       this.corpus = await corpusRes.json();
       this.timeline = await timelineRes.json();
@@ -140,7 +148,7 @@ export class ResponsoriaAudioEngine {
 
       // Pre-fetch sprite bytes immediately in background so playback starts instantly on click
       this.spriteFetchPromises = this.corpus.sprites.map((url) =>
-        fetch(url)
+        fetch(`${prefix}${url}`)
           .then((r) => (r.ok ? r.arrayBuffer() : null))
           .catch(() => null)
       );
@@ -249,10 +257,11 @@ export class ResponsoriaAudioEngine {
     if (!this.corpus) return;
     if (this._spriteLoadPromise) return this._spriteLoadPromise;
 
+    const prefix = getRootPrefix();
     const decodeSprite = async (url, idx) => {
       let arr = this.spriteFetchPromises[idx] ? await this.spriteFetchPromises[idx] : null;
       if (!arr) {
-        const res = await fetch(url);
+        const res = await fetch(`${prefix}${url}`);
         if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
         arr = await res.arrayBuffer();
       }

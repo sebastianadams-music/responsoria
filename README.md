@@ -24,6 +24,13 @@ Live at [responsoria.sebastianadams.net](https://responsoria.sebastianadams.net)
 >
 > There should be no UI elements, and no explanatory notes. The only text should be "responsoria 2026" as a title.
 
+## Versions
+
+The latest build is always served at the root ([responsoria.sebastianadams.net](https://responsoria.sebastianadams.net)) and archived under `/vN`:
+
+- **[v2](https://responsoria.sebastianadams.net/v2/)** *(current)*: Replaces farthest-point Answer Mode selection with a full 2D space inversion (`invertPoint`) that swaps interior ↔ perimeter regions while flipping both the MFCC (X) and Spectral Centroid (Y) axes, and adds versioned build archiving.
+- **[v1](https://responsoria.sebastianadams.net/v1/)**: Initial public release with 150 ms+ syllable segmentation, envelope-valley DP phrase detection (15–40 s), 12-band vocal-tract formant cross-synthesis, same-sample granular Overlap-Add sustain, farthest-point Answer Mode, mobile/iOS Safari Web Audio unlock, and startup prompt.
+
 ## Running Locally
 
 ```bash
@@ -31,9 +38,11 @@ npm install
 npm run dev
 ```
 
-To build the static bundle (`dist/`):
+To build the static bundle (`dist/`) and archive a new version snapshot (e.g., `v3`):
 
 ```bash
+npm run build
+npm run snapshot -- v3
 npm run build
 ```
 
