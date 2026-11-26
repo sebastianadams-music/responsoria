@@ -50,7 +50,7 @@ def winsorize_and_map(values: np.ndarray, low_pct=2.0, high_pct=98.0, out_min=0.
     return out_min + normed * (out_max - out_min)
 
 
-def compute_track_analysis(wav_path: Path, analysis_only: bool = False, trim_leading_silence: bool = False):
+def compute_track_analysis(wav_path: Path, analysis_only: bool = False, trim_leading_silence: bool = False, corpus_only: bool = False):
     # Load stereo for sprite extraction & mono for DSP
     y_stereo, sr_orig = sf.read(str(wav_path), always_2d=True, dtype="float32")
     y_mono_orig = np.mean(y_stereo, axis=1)
@@ -113,20 +113,24 @@ def compute_track_analysis(wav_path: Path, analysis_only: bool = False, trim_lea
     db_diff = np.maximum(0.0, np.diff(rms_fast_db, prepend=rms_fast_db[0]))
 
     # 20 Hz broadband + 12-band vocal-tract formant envelopes for cross-synthesis
-    S_env = np.abs(librosa.stft(y_mono, n_fft=FRAME_LENGTH, hop_length=ENV_HOP))
-    freqs_env = librosa.fft_frequencies(sr=SR_ANALYSIS, n_fft=FRAME_LENGTH)
-    f_safe = np.maximum(freqs_env, 1.0)
-    band_envs = np.zeros((len(FORMANT_CENTERS), S_env.shape[1]), dtype=np.float32)
-    for b, fc in enumerate(FORMANT_CENTERS):
-        H = 1.0 / np.sqrt(1.0 + (FORMANT_Q * (f_safe / fc - fc / f_safe)) ** 2)
-        H[0] = 0.0
-        band_envs[b] = np.sqrt(np.sum((S_env * H[:, None]) ** 2, axis=0) / (np.sum(H ** 2) + 1e-8))
-        band_envs[b] = uniform_filter1d(band_envs[b], size=2, mode="nearest")
+    if corpus_only:
+        env_broadband = None
+        env_bands = None
+    else:
+        S_env = np.abs(librosa.stft(y_mono, n_fft=FRAME_LENGTH, hop_length=ENV_HOP))
+        freqs_env = librosa.fft_frequencies(sr=SR_ANALYSIS, n_fft=FRAME_LENGTH)
+        f_safe = np.maximum(freqs_env, 1.0)
+        band_envs = np.zeros((len(FORMANT_CENTERS), S_env.shape[1]), dtype=np.float32)
+        for b, fc in enumerate(FORMANT_CENTERS):
+            H = 1.0 / np.sqrt(1.0 + (FORMANT_Q * (f_safe / fc - fc / f_safe)) ** 2)
+            H[0] = 0.0
+            band_envs[b] = np.sqrt(np.sum((S_env * H[:, None]) ** 2, axis=0) / (np.sum(H ** 2) + 1e-8))
+            band_envs[b] = uniform_filter1d(band_envs[b], size=2, mode="nearest")
 
-    bb_raw = librosa.feature.rms(y=y_mono, frame_length=FRAME_LENGTH, hop_length=ENV_HOP)[0]
-    n_env_frames = min(len(bb_raw), band_envs.shape[1])
-    env_broadband = uniform_filter1d(bb_raw[:n_env_frames], size=2, mode="nearest").astype(np.float32)
-    env_bands = band_envs[:, :n_env_frames]
+        bb_raw = librosa.feature.rms(y=y_mono, frame_length=FRAME_LENGTH, hop_length=ENV_HOP)[0]
+        n_env_frames = min(len(bb_raw), band_envs.shape[1])
+        env_broadband = uniform_filter1d(bb_raw[:n_env_frames], size=2, mode="nearest").astype(np.float32)
+        env_bands = band_envs[:, :n_env_frames]
 
     if analysis_only:
         hf_flux = None
@@ -351,7 +355,7 @@ def extract_notes_and_phrases(track_data, offset_sec: float):
     return notes, phrase_ends_abs, fallback_count
 
 
-def segment_syllables(track_idx: int, track_data):
+def segment_syllables(track_idx: int, track_data, min_seg_sec: float = 0.15):
     fps = SR_ANALYSIS / HOP_LENGTH
     superflux = track_data["superflux"]
     mfcc_delta = track_data["mfcc_delta"]
@@ -369,7 +373,7 @@ def segment_syllables(track_idx: int, track_data):
         + 0.20 * zscore(hf_flux)
     )
 
-    min_sep_frames = max(1, int(round(0.15 * fps)))
+    min_sep_frames = max(1, int(round(min_seg_sec * fps)))
     peaks, _ = find_peaks(novelty, height=0.05, distance=min_sep_frames, prominence=0.12)
 
     # Refine each boundary within +-35ms toward local RMS minimum (biased slightly before burst)
@@ -385,12 +389,12 @@ def segment_syllables(track_idx: int, track_data):
     # Ensure sorted unique boundaries
     boundaries = sorted(set([0.0] + refined_times + [duration]))
 
-    # Build segments clamped to [0.15s, 2.0s], subdividing >2.0s at secondary novelty peaks
+    # Build segments clamped to [min_seg_sec, 2.0s], subdividing >2.0s at secondary novelty peaks
     raw_spans = []
     for i in range(len(boundaries) - 1):
         t0, t1 = boundaries[i], boundaries[i + 1]
         span = t1 - t0
-        if span < 0.15:
+        if span < min_seg_sec:
             continue
         if span <= 2.0:
             raw_spans.append((t0, t1))
@@ -407,7 +411,7 @@ def segment_syllables(track_idx: int, track_data):
                     split_t = cur + 1.5
                 raw_spans.append((cur, split_t))
                 cur = split_t
-            if t1 - cur >= 0.15:
+            if t1 - cur >= min_seg_sec:
                 raw_spans.append((cur, t1))
 
     segments = []
@@ -491,8 +495,8 @@ def select_stratified_corpus(segments, target_count=TARGET_SEGMENTS, target_sec=
     return [segments[i] for i in selected_indices]
 
 
-def pack_sprites(selected_segments, tracks_stereo):
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+def pack_sprites(selected_segments, tracks_stereo, out_dir: Path = OUT_DIR, rel_prefix: str = "data/", min_seg_sec: float = 0.15):
+    out_dir.mkdir(parents=True, exist_ok=True)
     # Shuffle selected segments across sprites so sprite_0 alone already spans the full 2D plane and all movements
     rng = np.random.default_rng(2026)
     order = rng.permutation(len(selected_segments))
@@ -541,7 +545,7 @@ def pack_sprites(selected_segments, tracks_stereo):
                 pre_trim = max(0.0, actual_pre - 0.004)
                 clip_dur_sec = (s1 - s0) / SR_SPRITE
                 play_start_sec = (cursor_samples / SR_SPRITE) + pre_trim
-                play_dur_sec = min(clip_dur_sec - pre_trim, max(0.15, clip_dur_sec - pre_trim))
+                play_dur_sec = min(clip_dur_sec - pre_trim, max(min_seg_sec, clip_dur_sec - pre_trim))
 
                 gain_comp = float(np.clip((target_rms / max(seg["rms"], 1e-6)) ** 0.55, 0.45, 2.2))
 
@@ -560,8 +564,8 @@ def pack_sprites(selected_segments, tracks_stereo):
 
             full_wav = np.concatenate(chunks, axis=0)
             wav_path = tmp / f"sprite_{sprite_idx}.wav"
-            mp3_rel = f"data/sprite_{sprite_idx}.mp3"
-            mp3_path = OUT_DIR / f"sprite_{sprite_idx}.mp3"
+            mp3_rel = f"{rel_prefix}sprite_{sprite_idx}.mp3"
+            mp3_path = out_dir / f"sprite_{sprite_idx}.mp3"
             sf.write(str(wav_path), full_wav, SR_SPRITE, subtype="PCM_16")
 
             subprocess.run(
@@ -648,7 +652,15 @@ def build_formant_binary(tracks, total_duration: float) -> int:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--timeline-only", action="store_true", help="Only regenerate timeline.json and formants.bin using existing corpus/sprites")
+    parser.add_argument("--corpus-only", action="store_true", help="Only regenerate corpus.json and sprites without touching timeline.json or formants.bin")
+    parser.add_argument("--min-seg-ms", type=float, default=150.0, help="Minimum syllable segment length in milliseconds")
+    parser.add_argument("--corpus-dir", type=str, default="", help="Optional subdirectory under public/data/ for corpus output")
     args = parser.parse_args()
+
+    min_seg_sec = max(0.05, args.min_seg_ms / 1000.0)
+    corpus_subdir = args.corpus_dir.strip("/")
+    corpus_out_dir = OUT_DIR / corpus_subdir if corpus_subdir else OUT_DIR
+    rel_prefix = f"data/{corpus_subdir}/" if corpus_subdir else "data/"
 
     wav_files = sorted(RAW_DIR.glob("0[1-9].wav"))
     if len(wav_files) != 9:
@@ -663,63 +675,65 @@ def main():
                 wf,
                 analysis_only=args.timeline_only,
                 trim_leading_silence=(idx == 0),
+                corpus_only=args.corpus_only,
             )
         )
 
-    all_notes = []
-    all_phrase_ends = []
-    total_fallbacks = 0
-    offset = 0.0
-    for idx, td in enumerate(tracks):
-        notes, p_ends, fb = extract_notes_and_phrases(td, offset)
-        all_notes.extend(notes)
-        all_phrase_ends.extend(p_ends)
-        total_fallbacks += fb
-        offset += td["duration"] + INTER_TRACK_GAP
-
-    total_duration = offset - INTER_TRACK_GAP
-
-    phrase_durs = [pe - prev for prev, pe in zip([0.0] + all_phrase_ends[:-1], all_phrase_ends)]
-    below_15 = sum(1 for d in phrase_durs if d < 15.0)
-    above_40 = sum(1 for d in phrase_durs if d > 40.0)
-    print(f"\n--- Timeline Diagnostics ---")
-    print(f"Total duration : {total_duration:.2f}s ({total_duration/60:.2f} min)")
-    print(f"Total notes    : {len(all_notes)} ({len(all_notes)/total_duration:.2f} notes/sec)")
-    print(f"Total phrases  : {len(all_phrase_ends)} (fallbacks={total_fallbacks})")
-    print(
-        f"Phrase dur (s) : min={min(phrase_durs):.2f}, p25={np.percentile(phrase_durs, 25):.2f}, "
-        f"median={np.median(phrase_durs):.2f}, p75={np.percentile(phrase_durs, 75):.2f}, max={max(phrase_durs):.2f}"
-    )
-    print(f"Phrase bounds  : <15s={below_15}, >40s={above_40}")
-    print(f"First 15 durs  : {[round(d, 2) for d in phrase_durs[:15]]}")
-
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    total_env_frames = build_formant_binary(tracks, total_duration)
+    if not args.corpus_only:
+        all_notes = []
+        all_phrase_ends = []
+        total_fallbacks = 0
+        offset = 0.0
+        for idx, td in enumerate(tracks):
+            notes, p_ends, fb = extract_notes_and_phrases(td, offset)
+            all_notes.extend(notes)
+            all_phrase_ends.extend(p_ends)
+            total_fallbacks += fb
+            offset += td["duration"] + INTER_TRACK_GAP
 
-    timeline_json = {
-        "duration": round(total_duration, 3),
-        "notes": all_notes,
-        "phraseEnds": all_phrase_ends,
-        "envFps": ENV_FPS,
-        "envBands": FORMANT_CENTERS,
-        "envQ": FORMANT_Q,
-        "envFrames": total_env_frames,
-    }
-    (OUT_DIR / "timeline.json").write_text(json.dumps(timeline_json, separators=(",", ":")))
+        total_duration = offset - INTER_TRACK_GAP
 
-    if args.timeline_only:
-        print(f"\n--- Output Summary (timeline-only) ---")
-        print(f"timeline.json: {len(all_notes)} notes, {len(all_phrase_ends)} phraseEnds, {(OUT_DIR / 'timeline.json').stat().st_size / 1024:.1f} KB")
-        return
+        phrase_durs = [pe - prev for prev, pe in zip([0.0] + all_phrase_ends[:-1], all_phrase_ends)]
+        below_15 = sum(1 for d in phrase_durs if d < 15.0)
+        above_40 = sum(1 for d in phrase_durs if d > 40.0)
+        print(f"\n--- Timeline Diagnostics ---")
+        print(f"Total duration : {total_duration:.2f}s ({total_duration/60:.2f} min)")
+        print(f"Total notes    : {len(all_notes)} ({len(all_notes)/total_duration:.2f} notes/sec)")
+        print(f"Total phrases  : {len(all_phrase_ends)} (fallbacks={total_fallbacks})")
+        print(
+            f"Phrase dur (s) : min={min(phrase_durs):.2f}, p25={np.percentile(phrase_durs, 25):.2f}, "
+            f"median={np.median(phrase_durs):.2f}, p75={np.percentile(phrase_durs, 75):.2f}, max={max(phrase_durs):.2f}"
+        )
+        print(f"Phrase bounds  : <15s={below_15}, >40s={above_40}")
+        print(f"First 15 durs  : {[round(d, 2) for d in phrase_durs[:15]]}")
+
+        total_env_frames = build_formant_binary(tracks, total_duration)
+
+        timeline_json = {
+            "duration": round(total_duration, 3),
+            "notes": all_notes,
+            "phraseEnds": all_phrase_ends,
+            "envFps": ENV_FPS,
+            "envBands": FORMANT_CENTERS,
+            "envQ": FORMANT_Q,
+            "envFrames": total_env_frames,
+        }
+        (OUT_DIR / "timeline.json").write_text(json.dumps(timeline_json, separators=(",", ":")))
+
+        if args.timeline_only:
+            print(f"\n--- Output Summary (timeline-only) ---")
+            print(f"timeline.json: {len(all_notes)} notes, {len(all_phrase_ends)} phraseEnds, {(OUT_DIR / 'timeline.json').stat().st_size / 1024:.1f} KB")
+            return
 
     # Segment syllables across all 9 tracks
     all_segments = []
     for idx, td in enumerate(tracks):
-        segs = segment_syllables(idx, td)
+        segs = segment_syllables(idx, td, min_seg_sec=min_seg_sec)
         all_segments.extend(segs)
         print(f"  Track {idx+1:02d}: {len(segs)} syllable segments")
 
-    print(f"Total valid syllable segments: {len(all_segments)}")
+    print(f"Total valid syllable segments (>= {args.min_seg_ms:.0f}ms): {len(all_segments)}")
 
     # Compute 2D Feature Space: X = MFCC, Y = Spectral Centroid
     log_cents = np.array([s["log_centroid"] for s in all_segments], dtype=np.float64)
@@ -766,25 +780,23 @@ def main():
     print(f"Selected {len(selected)} stratified segments (~{sum(s['dur'] for s in selected):.1f}s pure audio)")
 
     tracks_stereo = [td["y_st"] for td in tracks]
-    sprite_paths, corpus_segments = pack_sprites(selected, tracks_stereo)
+    sprite_paths, corpus_segments = pack_sprites(
+        selected,
+        tracks_stereo,
+        out_dir=corpus_out_dir,
+        rel_prefix=rel_prefix,
+        min_seg_sec=min_seg_sec,
+    )
 
     corpus_json = {
         "sprites": sprite_paths,
         "segments": corpus_segments,
     }
-    timeline_json = {
-        "duration": round(total_duration, 3),
-        "notes": all_notes,
-        "phraseEnds": all_phrase_ends,
-    }
+    (corpus_out_dir / "corpus.json").write_text(json.dumps(corpus_json, separators=(",", ":")))
 
-    (OUT_DIR / "corpus.json").write_text(json.dumps(corpus_json, separators=(",", ":")))
-    (OUT_DIR / "timeline.json").write_text(json.dumps(timeline_json, separators=(",", ":")))
-
-    total_mp3_bytes = sum((OUT_DIR / f"sprite_{i}.mp3").stat().st_size for i in range(NUM_SPRITES))
+    total_mp3_bytes = sum((corpus_out_dir / f"sprite_{i}.mp3").stat().st_size for i in range(NUM_SPRITES))
     print(f"\n--- Output Summary ---")
-    print(f"corpus.json  : {len(corpus_segments)} segments, {(OUT_DIR / 'corpus.json').stat().st_size / 1024:.1f} KB")
-    print(f"timeline.json: {len(all_notes)} notes, {len(all_phrase_ends)} phraseEnds, {(OUT_DIR / 'timeline.json').stat().st_size / 1024:.1f} KB")
+    print(f"corpus.json  : {len(corpus_segments)} segments in {corpus_out_dir}, {(corpus_out_dir / 'corpus.json').stat().st_size / 1024:.1f} KB")
     print(f"5 MP3 sprites: {total_mp3_bytes / (1024 * 1024):.2f} MB total")
 
 
