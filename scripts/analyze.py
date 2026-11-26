@@ -373,7 +373,8 @@ def segment_syllables(track_idx: int, track_data, min_seg_sec: float = 0.15):
         + 0.20 * zscore(hf_flux)
     )
 
-    min_sep_frames = max(1, int(round(min_seg_sec * fps)))
+    sep_sec = min_seg_sec + 0.05 if min_seg_sec >= 0.5 else min_seg_sec
+    min_sep_frames = max(1, int(round(sep_sec * fps)))
     peaks, _ = find_peaks(novelty, height=0.05, distance=min_sep_frames, prominence=0.12)
 
     # Refine each boundary within +-35ms toward local RMS minimum (biased slightly before burst)
@@ -389,26 +390,32 @@ def segment_syllables(track_idx: int, track_data, min_seg_sec: float = 0.15):
     # Ensure sorted unique boundaries
     boundaries = sorted(set([0.0] + refined_times + [duration]))
 
-    # Build segments clamped to [min_seg_sec, 2.0s], subdividing >2.0s at secondary novelty peaks
+    # Build segments clamped to [min_seg_sec, max_seg_sec], subdividing long spans at secondary novelty peaks
+    max_seg_sec = max(2.0, min_seg_sec * 2.5)
     raw_spans = []
     for i in range(len(boundaries) - 1):
         t0, t1 = boundaries[i], boundaries[i + 1]
         span = t1 - t0
         if span < min_seg_sec:
             continue
-        if span <= 2.0:
+        if span <= max_seg_sec:
             raw_spans.append((t0, t1))
         else:
-            # Subdivide long sustained spans at secondary peaks or max 1.8s chunks
             cur = t0
-            while t1 - cur > 2.0:
-                f0 = int(round((cur + 0.35) * fps))
-                f1 = min(len(novelty) - 1, int(round((cur + 1.85) * fps)))
+            fallback_step = min(max_seg_sec - 0.2, max(1.5, min_seg_sec * 1.5))
+            while t1 - cur > max_seg_sec:
+                lo_t = cur + max(0.35, min_seg_sec)
+                hi_t = cur + max_seg_sec - 0.15
+                f0 = int(round(lo_t * fps))
+                f1 = min(len(novelty) - 1, int(round(hi_t * fps)))
+                split_t = cur + fallback_step
                 if f1 > f0 + 1:
                     sub_p = f0 + int(np.argmax(novelty[f0:f1]))
-                    split_t = float(sub_p / fps)
-                else:
-                    split_t = cur + 1.5
+                    cand_t = float(sub_p / fps)
+                    if cand_t - cur >= min_seg_sec and t1 - cand_t >= min_seg_sec:
+                        split_t = cand_t
+                if t1 - split_t < min_seg_sec:
+                    break
                 raw_spans.append((cur, split_t))
                 cur = split_t
             if t1 - cur >= min_seg_sec:
@@ -776,7 +783,8 @@ def main():
     print(f"Feature space Pearson r(x, y) = {r_final:.4f}; 10x10 occupied bins = {occupied_bins}/100")
 
     # Select stratified corpus and pack sprites
-    selected = select_stratified_corpus(all_segments, TARGET_SEGMENTS, TARGET_PACKED_SEC)
+    target_packed = max(TARGET_PACKED_SEC, 380.0) if min_seg_sec >= 0.8 else TARGET_PACKED_SEC
+    selected = select_stratified_corpus(all_segments, TARGET_SEGMENTS, target_packed)
     print(f"Selected {len(selected)} stratified segments (~{sum(s['dur'] for s in selected):.1f}s pure audio)")
 
     tracks_stereo = [td["y_st"] for td in tracks]

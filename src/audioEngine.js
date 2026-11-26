@@ -13,7 +13,7 @@ for (let i = 0; i < CURVE_LEN; i++) {
 
 const DEFAULT_FORMANT_BANDS = [180, 290, 440, 650, 920, 1280, 1750, 2350, 3150, 4200, 5600, 7400];
 const BAND_MAKEUP = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.05, 1.12, 1.25, 1.45, 1.65, 1.8];
-const CORPUS_JSON_PATH = "data/corpus_300ms/corpus.json";
+const CORPUS_JSON_PATH = "data/corpus_1000ms/corpus.json";
 
 function scaledCurve(base, peak) {
   const out = new Float32Array(base.length);
